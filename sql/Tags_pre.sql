@@ -4,5 +4,6 @@ CREATE TABLE Tags (
     TagName               text not NULL    ,
     Count                 int              ,
     ExcerptPostId         int              ,
-    WikiPostId            int
+    WikiPostId            int              ,
+    jsonfield             jsonb
 );
