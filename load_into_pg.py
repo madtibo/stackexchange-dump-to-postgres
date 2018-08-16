@@ -1,8 +1,9 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import sys
 import time
 import argparse
 import psycopg2 as pg
+import os
 import row_processor as Processor
 import six
 
@@ -10,6 +11,51 @@ import six
 specialRules = {
     ('Posts', 'ViewCount'): "NULLIF(%(ViewCount)s, '')::int"
 }
+
+# part of the file already downloaded
+file_part = None
+
+def show_progress(block_num, block_size, total_size):
+    """Display the total size of the file to download and the progess in percent"""
+    global file_part
+    if file_part is None:
+        suffixes=['B','KB','MB','GB','TB']
+        suffixIndex = 0
+        pp_size = total_size
+        while pp_size > 1024:
+            suffixIndex += 1 #increment the index of the suffix
+            pp_size = pp_size/1024.0 #apply the division
+        six.print_('Total file size is: {0:.1f} {1}'.format(pp_size,suffixes[suffixIndex]))
+        six.print_("0 % of the file downloaded ...\r", end="", flush=True)
+        file_part = 0
+
+    downloaded = block_num * block_size
+    if downloaded < total_size:
+        percent = 100 * downloaded / total_size
+        if percent - file_part > 1:
+            file_part = percent
+            six.print_("{0} % of the file downloaded ...\r".format(int(percent)), end="", flush=True)
+    else:
+        file_part = None
+        six.print_("")
+
+def buildConnectionString(dbname, mbHost, mbPort, mbUsername, mbPassword):
+    dbConnectionParam = "dbname={}".format(dbname)
+
+    if mbPort is not None:
+        dbConnectionParam += ' port={}'.format(mbPort)
+
+    if mbHost is not None:
+        dbConnectionParam += ' host={}'.format(mbHost)
+
+    # TODO Is the escaping done here correct?
+    if mbUsername is not None:
+        dbConnectionParam += ' user={}'.format(mbUsername)
+
+    # TODO Is the escaping done here correct?
+    if mbPassword is not None:
+        dbConnectionParam += ' password={}'.format(mbPassword)
+    return dbConnectionParam
 
 def _makeDefValues(keys):
     """Returns a dictionary containing None for all keys."""
@@ -141,7 +187,7 @@ def _getTableKeys(table):
         ]
     return keys
 
-def handleTable(table, keys, dbname, mbDbFile, mbHost, mbPort, mbUsername, mbPassword):
+def handleTable(table, createFk, mbDbFile, dbConnectionParam):
     """Handle the table including the post/pre processing."""
     keys       = _getTableKeys(table)
     dbFile     = mbDbFile if mbDbFile is not None else table + '.xml'
@@ -155,23 +201,6 @@ def handleTable(table, keys, dbname, mbDbFile, mbHost, mbPort, mbUsername, mbPas
     except IOError as e:
         six.print_("Could not load pre/post/fk sql. Are you running from the correct path?", file=sys.stderr)
         sys.exit(-1)
-
-    dbConnectionParam = "dbname={}".format(dbname)
-
-    if mbPort is not None:
-        dbConnectionParam += ' port={}'.format(mbPort)
-
-    if mbHost is not None:
-        dbConnectionParam += ' host={}'.format(mbHost)
-
-    # TODO Is the escaping done here correct?
-    if mbUsername is not None:
-        dbConnectionParam += ' user={}'.format(mbUsername)
-
-    # TODO Is the escaping done here correct?
-    if mbPassword is not None:
-        dbConnectionParam += ' password={}'.format(mbPassword)
-
 
     try:
         with pg.connect(dbConnectionParam) as conn:
@@ -199,7 +228,7 @@ def handleTable(table, keys, dbname, mbDbFile, mbHost, mbPort, mbUsername, mbPas
                                       ' VALUES\n' + valuesStr + ';'
                                 cur.execute(cmd)
                                 conn.commit()
-                        six.print_('Table processing took {1:.1f} seconds'.format(table, time.time() - start_time))
+                        six.print_('Table \'{0}\' processing took {1:.1f} seconds'.format(table, time.time() - start_time))
 
                         # Post-processing (creation of indexes)
                         start_time = time.time()
@@ -228,12 +257,32 @@ def handleTable(table, keys, dbname, mbDbFile, mbHost, mbPort, mbUsername, mbPas
         six.print_("Warning from the database.", file=sys.stderr)
         six.print_("pg.Warning: {0}".format(str(w)), file=sys.stderr)
 
+
+def moveTableToSchema(table, schemaName, dbConnectionParam):
+    try:
+        with pg.connect(dbConnectionParam) as conn:
+            with conn.cursor() as cur:
+                # create the schema
+                cur.execute('CREATE SCHEMA IF NOT EXISTS '+schemaName+';')
+                conn.commit()
+                # move the table to the right schema
+                cur.execute('ALTER TABLE '+table+' SET SCHEMA '+schemaName+';')
+                conn.commit()
+    except pg.Error as e:
+        six.print_("Error in dealing with the database.", file=sys.stderr)
+        six.print_("pg.Error ({0}): {1}".format(e.pgcode, e.pgerror), file=sys.stderr)
+        six.print_(str(e), file=sys.stderr)
+    except pg.Warning as w:
+        six.print_("Warning from the database.", file=sys.stderr)
+        six.print_("pg.Warning: {0}".format(str(w)), file=sys.stderr)
+
 #############################################################
 
 parser = argparse.ArgumentParser()
-parser.add_argument( 'table'
+parser.add_argument( '-t', '--table'
                    , help    = 'The table to work on.'
                    , choices = ['Users', 'Badges', 'Posts', 'Tags', 'Votes', 'PostLinks', 'PostHistory', 'Comments']
+                   , default = None
                    )
 
 parser.add_argument( '-d', '--dbname'
@@ -244,6 +293,16 @@ parser.add_argument( '-d', '--dbname'
 parser.add_argument( '-f', '--file'
                    , help    = 'Name of the file to extract data from.'
                    , default = None
+                   )
+
+parser.add_argument( '-s', '--so-project'
+                   , help    = 'stackexchange project to load.'
+                   , default = None
+                   )
+
+parser.add_argument( '--archive-url'
+                   , help    = 'URL of the archive directory to retrieve.'
+                   , default = 'https://ia800107.us.archive.org/27/items/stackexchange'
                    )
 
 parser.add_argument( '-u', '--username'
@@ -272,6 +331,11 @@ parser.add_argument( '--with-post-body'
                    , default = False
                    )
 
+parser.add_argument( '-n', '--schema-name'
+                   , help    = 'Use specific schema.'
+                   , default = 'public'
+                   )
+
 parser.add_argument( '--foreign-keys'
                    , help    = 'Create foreign keys.'
                    , action = 'store_true'
@@ -280,22 +344,69 @@ parser.add_argument( '--foreign-keys'
 
 args = parser.parse_args()
 
-table = args.table
-
 try:
     # Python 2/3 compatibility
     input = raw_input
 except NameError:
     pass
 
+dbConnectionParam = buildConnectionString(args.dbname, args.host, args.port, args.username, args.password)
 
-if table == 'Posts':
-    # If the user has not explicitly asked for loading the body, we replace it with NULL
-    if not args.with_post_body:
-        specialRules[('Posts', 'Body')] = 'NULL'
+# load given file in table
+if args.file and args.table:
+    table = args.table
 
-choice = input('This will drop the {} table. Are you sure [y/n]?'.format(table))
-if len(choice) > 0 and choice[0].lower() == 'y':
-    handleTable(table, keys, args.dbname, args.file, args.host, args.port, args.username, args.password)
+    if table == 'Posts':
+        # If the user has not explicitly asked for loading the body, we replace it with NULL
+        if not args.with_post_body:
+            specialRules[('Posts', 'Body')] = 'NULL'
+
+    choice = input('This will drop the {} table. Are you sure [y/n]?'.format(table))
+    if len(choice) > 0 and choice[0].lower() == 'y':
+        handleTable(table, args.foreign_keys, args.file, dbConnectionParam)
+    else:
+        six.print_("Cancelled.")
+    if args.schema_name != 'public':
+        moveTableToSchema(table, args.schema_name, dbConnectionParam)
+    exit(0)
+
+# load a project
+elif args.so_project:
+    import urllib.request
+    import libarchive
+
+    # download the 7z archive in /tmp
+    file_name = args.so_project + '.stackexchange.com.7z'
+    url = '{0}/{1}'.format(args.archive_url, file_name)
+    filepath = '/tmp/'+file_name
+    six.print_('Downloading the archive, please be patient ...')
+    try:
+        urllib.request.urlretrieve(url, filepath, show_progress)
+    except Exception as e:
+        six.print_('Error: impossible to download the {0} archive ({1})'.format(url, e))
+        exit(1)
+
+    try:
+        libarchive.extract_file(filepath)
+    except Exception as e:
+        six.print_('Error: impossible to extract the {0} archive ({1})'.format(url, e))
+        exit(1)
+
+    tables = [ 'Tags', 'Users', 'Badges', 'Posts', 'Comments', 'Votes', 'PostLinks', 'PostHistory' ]
+
+    for table in tables:
+        six.print_('Load {0}.xml file'.format(table))
+        handleTable(table, args.foreign_keys, args.file, dbConnectionParam)
+        # remove file
+        os.remove(table+'.xml')
+    # remove archive
+    os.remove(filepath)
+
+    if args.schema_name != 'public':
+        for table in tables:
+            moveTableToSchema(table, args.schema_name, dbConnectionParam)
+    exit(0)
+
 else:
-    six.print_("Cancelled.")
+    six.print_("Error: you must either use '-f' and '-t'  arguments or the '-s' argument.")
+    parser.print_help()
